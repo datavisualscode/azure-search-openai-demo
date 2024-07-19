@@ -6,13 +6,14 @@ from openai import AsyncOpenAI, AsyncStream
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
+    ChatCompletionMessageParam,
     ChatCompletionToolParam,
 )
+from openai_messages_token_helper import build_messages, get_token_limit
 
 from approaches.approach import ThoughtStep
 from approaches.chatapproach import ChatApproach
 from core.authentication import AuthenticationHelper
-from core.modelhelper import get_token_limit
 
 
 class ChatReadRetrieveReadApproach(ChatApproach):
@@ -32,6 +33,7 @@ class ChatReadRetrieveReadApproach(ChatApproach):
         chatgpt_deployment: Optional[str],  # Not needed for non-Azure OpenAI
         embedding_deployment: Optional[str],  # Not needed for non-Azure OpenAI or for retrieval_mode="text"
         embedding_model: str,
+        embedding_dimensions: int,
         sourcepage_field: str,
         content_field: str,
         query_language: str,
@@ -44,6 +46,7 @@ class ChatReadRetrieveReadApproach(ChatApproach):
         self.chatgpt_deployment = chatgpt_deployment
         self.embedding_deployment = embedding_deployment
         self.embedding_model = embedding_model
+        self.embedding_dimensions = embedding_dimensions
         self.sourcepage_field = sourcepage_field
         self.content_field = content_field
         self.query_language = query_language
@@ -63,7 +66,7 @@ class ChatReadRetrieveReadApproach(ChatApproach):
     @overload
     async def run_until_final_call(
         self,
-        history: list[dict[str, str]],
+        messages: list[ChatCompletionMessageParam],
         overrides: dict[str, Any],
         auth_claims: dict[str, Any],
         should_stream: Literal[False],
@@ -72,7 +75,7 @@ class ChatReadRetrieveReadApproach(ChatApproach):
     @overload
     async def run_until_final_call(
         self,
-        history: list[dict[str, str]],
+        messages: list[ChatCompletionMessageParam],
         overrides: dict[str, Any],
         auth_claims: dict[str, Any],
         should_stream: Literal[True],
@@ -80,22 +83,24 @@ class ChatReadRetrieveReadApproach(ChatApproach):
 
     async def run_until_final_call(
         self,
-        history: list[dict[str, str]],
+        messages: list[ChatCompletionMessageParam],
         overrides: dict[str, Any],
         auth_claims: dict[str, Any],
         should_stream: bool = False,
     ) -> tuple[dict[str, Any], Coroutine[Any, Any, Union[ChatCompletion, AsyncStream[ChatCompletionChunk]]]]:
-        has_text = overrides.get("retrieval_mode") in ["text", "hybrid", None]
-        has_vector = overrides.get("retrieval_mode") in ["vectors", "hybrid", None]
-        use_semantic_captions = True if overrides.get("semantic_captions") and has_text else False
+        seed = overrides.get("seed", None)
+        use_text_search = overrides.get("retrieval_mode") in ["text", "hybrid", None]
+        use_vector_search = overrides.get("retrieval_mode") in ["vectors", "hybrid", None]
+        use_semantic_ranker = True if overrides.get("semantic_ranker") else False
+        use_semantic_captions = True if overrides.get("semantic_captions") else False
         top = overrides.get("top", 3)
         minimum_search_score = overrides.get("minimum_search_score", 0.0)
         minimum_reranker_score = overrides.get("minimum_reranker_score", 0.0)
-
         filter = self.build_filter(overrides, auth_claims)
-        use_semantic_ranker = True if overrides.get("semantic_ranker") and has_text else False
 
-        original_user_query = history[-1]["content"]
+        original_user_query = messages[-1]["content"]
+        if not isinstance(original_user_query, str):
+            raise ValueError("The most recent message content must be a string.")
         user_query_request = "Generate search query for: " + original_user_query
 
         tools: List[ChatCompletionToolParam] = [
@@ -119,13 +124,15 @@ class ChatReadRetrieveReadApproach(ChatApproach):
         ]
 
         # STEP 1: Generate an optimized keyword search query based on the chat history and the last question
-        query_messages = self.get_messages_from_history(
+        query_response_token_limit = 100
+        query_messages = build_messages(
+            model=self.chatgpt_model,
             system_prompt=self.query_prompt_template,
-            model_id=self.chatgpt_model,
-            history=history,
-            user_content=user_query_request,
-            max_tokens=self.chatgpt_token_limit - len(user_query_request),
+            tools=tools,
             few_shots=self.query_prompt_few_shots,
+            past_messages=messages[:-1],
+            new_user_content=user_query_request,
+            max_tokens=self.chatgpt_token_limit - query_response_token_limit,
         )
 
         chat_completion: ChatCompletion = await self.openai_client.chat.completions.create(
@@ -133,10 +140,10 @@ class ChatReadRetrieveReadApproach(ChatApproach):
             # Azure OpenAI takes the deployment name as the model name
             model=self.chatgpt_deployment if self.chatgpt_deployment else self.chatgpt_model,
             temperature=0.0,  # Minimize creativity for search query generation
-            max_tokens=100,  # Setting too low risks malformed JSON, setting too high may affect performance
+            max_tokens=query_response_token_limit,  # Setting too low risks malformed JSON, setting too high may affect performance
             n=1,
             tools=tools,
-            tool_choice="auto",
+            seed=seed,
         )
 
         query_text = self.get_search_query(chat_completion, original_user_query)
@@ -145,18 +152,16 @@ class ChatReadRetrieveReadApproach(ChatApproach):
 
         # If retrieval mode includes vectors, compute an embedding for the query
         vectors: list[VectorQuery] = []
-        if has_vector:
+        if use_vector_search:
             vectors.append(await self.compute_text_embedding(query_text))
-
-        # Only keep the text query if the retrieval mode uses text, otherwise drop it
-        if not has_text:
-            query_text = None
 
         results = await self.search(
             top,
             query_text,
             filter,
             vectors,
+            use_text_search,
+            use_vector_search,
             use_semantic_ranker,
             use_semantic_captions,
             minimum_search_score,
@@ -175,14 +180,13 @@ class ChatReadRetrieveReadApproach(ChatApproach):
         )
 
         response_token_limit = 1024
-        messages_token_limit = self.chatgpt_token_limit - response_token_limit
-        messages = self.get_messages_from_history(
+        messages = build_messages(
+            model=self.chatgpt_model,
             system_prompt=system_message,
-            model_id=self.chatgpt_model,
-            history=history,
+            past_messages=messages[:-1],
             # Model does not handle lengthy system messages well. Moving sources to latest user conversation to solve follow up questions prompt.
-            user_content=original_user_query + "\n\nSources:\n" + content,
-            max_tokens=messages_token_limit,
+            new_user_content=original_user_query + "\n\nSources:\n" + content,
+            max_tokens=self.chatgpt_token_limit - response_token_limit,
         )
 
         data_points = {"text": sources_content}
@@ -207,7 +211,8 @@ class ChatReadRetrieveReadApproach(ChatApproach):
                         "use_semantic_ranker": use_semantic_ranker,
                         "top": top,
                         "filter": filter,
-                        "has_vector": has_vector,
+                        "use_vector_search": use_vector_search,
+                        "use_text_search": use_text_search,
                     },
                 ),
                 ThoughtStep(
@@ -234,5 +239,6 @@ class ChatReadRetrieveReadApproach(ChatApproach):
             max_tokens=response_token_limit,
             n=1,
             stream=should_stream,
+            seed=seed,
         )
         return (extra_info, chat_coroutine)

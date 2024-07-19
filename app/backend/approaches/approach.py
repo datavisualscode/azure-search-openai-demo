@@ -1,7 +1,16 @@
 import os
 from abc import ABC
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Union, cast
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    List,
+    Optional,
+    TypedDict,
+    cast,
+)
 from urllib.parse import urljoin
 
 import aiohttp
@@ -13,6 +22,7 @@ from azure.search.documents.models import (
     VectorQuery,
 )
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 from core.authentication import AuthenticationHelper
 from text import nonewlines
@@ -90,6 +100,7 @@ class Approach(ABC):
         query_speller: Optional[str],
         embedding_deployment: Optional[str],  # Not needed for non-Azure OpenAI or for retrieval_mode="text"
         embedding_model: str,
+        embedding_dimensions: int,
         openai_host: str,
         vision_endpoint: str,
         vision_token_provider: Callable[[], Awaitable[str]],
@@ -101,6 +112,7 @@ class Approach(ABC):
         self.query_speller = query_speller
         self.embedding_deployment = embedding_deployment
         self.embedding_model = embedding_model
+        self.embedding_dimensions = embedding_dimensions
         self.openai_host = openai_host
         self.vision_endpoint = vision_endpoint
         self.vision_token_provider = vision_token_provider
@@ -121,27 +133,34 @@ class Approach(ABC):
         query_text: Optional[str],
         filter: Optional[str],
         vectors: List[VectorQuery],
+        use_text_search: bool,
+        use_vector_search: bool,
         use_semantic_ranker: bool,
         use_semantic_captions: bool,
         minimum_search_score: Optional[float],
         minimum_reranker_score: Optional[float],
     ) -> List[Document]:
-        # Use semantic ranker if requested and if retrieval mode is text or hybrid (vectors + text)
-        if use_semantic_ranker and query_text:
+        search_text = query_text if use_text_search else ""
+        search_vectors = vectors if use_vector_search else []
+        if use_semantic_ranker:
             results = await self.search_client.search(
-                search_text=query_text,
+                search_text=search_text,
                 filter=filter,
+                top=top,
+                query_caption="extractive|highlight-false" if use_semantic_captions else None,
+                vector_queries=search_vectors,
                 query_type=QueryType.SEMANTIC,
                 query_language=self.query_language,
                 query_speller=self.query_speller,
                 semantic_configuration_name="default",
-                top=top,
-                query_caption="extractive|highlight-false" if use_semantic_captions else None,
-                vector_queries=vectors,
+                semantic_query=query_text,
             )
         else:
             results = await self.search_client.search(
-                search_text=query_text or "", filter=filter, top=top, vector_queries=vectors
+                search_text=search_text,
+                filter=filter,
+                top=top,
+                vector_queries=search_vectors,
             )
 
         documents = []
@@ -204,10 +223,23 @@ class Approach(ABC):
             return sourcepage
 
     async def compute_text_embedding(self, q: str):
+        SUPPORTED_DIMENSIONS_MODEL = {
+            "text-embedding-ada-002": False,
+            "text-embedding-3-small": True,
+            "text-embedding-3-large": True,
+        }
+
+        class ExtraArgs(TypedDict, total=False):
+            dimensions: int
+
+        dimensions_args: ExtraArgs = (
+            {"dimensions": self.embedding_dimensions} if SUPPORTED_DIMENSIONS_MODEL[self.embedding_model] else {}
+        )
         embedding = await self.openai_client.embeddings.create(
             # Azure OpenAI takes the deployment name as the model name
             model=self.embedding_deployment if self.embedding_deployment else self.embedding_model,
             input=q,
+            **dimensions_args,
         )
         query_vector = embedding.data[0].embedding
         return VectorizedQuery(vector=query_vector, k_nearest_neighbors=50, fields="embedding")
@@ -229,6 +261,17 @@ class Approach(ABC):
         return VectorizedQuery(vector=image_query_vector, k_nearest_neighbors=50, fields="imageEmbedding")
 
     async def run(
-        self, messages: list[dict], stream: bool = False, session_state: Any = None, context: dict[str, Any] = {}
-    ) -> Union[dict[str, Any], AsyncGenerator[dict[str, Any], None]]:
+        self,
+        messages: list[ChatCompletionMessageParam],
+        session_state: Any = None,
+        context: dict[str, Any] = {},
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def run_stream(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        session_state: Any = None,
+        context: dict[str, Any] = {},
+    ) -> AsyncGenerator[dict[str, Any], None]:
         raise NotImplementedError
